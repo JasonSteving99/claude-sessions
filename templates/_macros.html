@@ -1,0 +1,72 @@
+{% macro render_card(s) %}
+      <div class="{{ s.card_cls }}">
+        <div class="card-top">
+          <div class="card-title">
+            <div class="{{ s.dot_cls }}"></div>
+            <span class="sname">{{ s.name }}</span>
+          </div>
+          <div class="actions">
+            {% if s.live %}
+              <a class="btn open" href="/sessions/{{ s.name }}/" target="_blank">Open ↗</a>
+            {% else %}
+              <span style="color:#484f58;font-size:0.8rem">stopped</span>
+            {% endif %}
+            <form method="POST" action="/sessions/{{ s.name }}/kill" style="margin:0">
+              <button type="submit" class="btn kill">Kill</button>
+            </form>
+          </div>
+        </div>
+        {% if s.title %}<div class="card-subtitle">{{ s.title }}</div>{% endif %}
+        <div class="meta">
+          <div class="mi"><span class="ml">cmd</span><span class="mv {{ s.cmd_cls }}">{{ s.cmd }}</span></div>
+          <div class="mi"><span class="ml">created</span><span class="mv">{{ s.created_rel }}</span></div>
+          <div class="mi"><span class="ml">views</span><span class="mv {{ s.views_cls }}">{{ s.views_label }}</span></div>
+          <div class="mi"><span class="ml">activity</span><span class="mv">{{ s.activity_rel }}</span></div>
+        </div>
+        {% if s.usage %}
+          {% set u = s.usage %}
+      <div class="usage">
+        <div class="usage-row">
+          <div class="ustat"><span class="ul">in</span><span class="uv">{{ u['in'] }}</span></div>
+          <div class="ustat"><span class="ul">out</span><span class="uv">{{ u.out }}</span></div>
+          <div class="ustat"><span class="ul">cache↑</span><span class="uv dim">{{ u.cache_read }}</span></div>
+        </div>
+        <div class="ctx-wrap">
+          <span class="ul">ctx</span>
+          <div class="ctx-bar"><div class="{{ u.fill_cls }}" style="width:{{ u.ctx_width }}%"></div></div>
+          <span class="ctx-label">{{ u.ctx }} / {{ u.max_ctx }} ({{ u.ctx_pct }}%)</span>
+        </div>
+      </div>
+        {% else %}
+          <div class="usage"><span class="no-usage">no usage data yet</span></div>
+        {% endif %}
+      </div>
+{% endmacro %}
+
+{% macro render_project_group(p) %}
+    <section class="project-group">
+      <header class="project-header">
+        <div class="project-id">
+          <div class="project-id-left">
+            <span class="project-name">{{ p.project }}</span>
+            <span class="project-count">{{ p.count }} session{{ p.suffix }}</span>
+          </div>
+          <div class="project-actions">
+            <form method="POST" action="/sessions" target="_blank" style="margin:0">
+              <input type="hidden" name="name" value="{{ p.project }}" />
+              <button type="submit" class="btn add-session">+ Session</button>
+            </form>
+            <button type="button" class="btn project-delete"
+                    data-project="{{ p.project }}"
+                    data-dir="{{ p.project_dir }}"
+                    data-count="{{ p.count }}"
+                    onclick="confirmDestroy(this)">Delete</button>
+          </div>
+        </div>
+        <div class="project-dir">{{ p.project_dir }}</div>
+      </header>
+      <div class="project-sessions">
+        {% for s in p.sessions %}{{ render_card(s) }}{% endfor %}
+      </div>
+    </section>
+{% endmacro %}

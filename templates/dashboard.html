@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Claude Sessions</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+
+<header>
+  <h1>Claude Sessions</h1>
+  <span class="hint" id="refresh-hint">live</span>
+</header>
+<div class="groups">
+  <div id="groups">
+{% include "groups.html" %}
+  </div>
+  <section class="project-group new-project">
+    <header class="project-header">
+      <div class="project-id">
+        <div class="project-id-left">
+          <span class="project-name">+ New Project</span>
+        </div>
+      </div>
+      <div class="project-dir">Creates {{ project_base }}/&lt;name&gt;. Reusing a name on an existing project adds a session to it instead.</div>
+    </header>
+    <form class="new-project-form" method="POST" action="/sessions" target="_blank"
+          onsubmit="setTimeout(() => this.reset(), 0)">
+      <input type="text" name="name" placeholder="my-project" required />
+      <button type="submit" class="btn create">Create &amp; Open</button>
+    </form>
+  </section>
+</div>
+
+<div id="destroy-modal" class="modal-bg" style="display:none" onclick="if(event.target.id==='destroy-modal')closeModal()">
+  <div class="modal-card">
+    <h2>Delete project</h2>
+    <p>This will <strong>kill <span id="m-count"></span> session(s)</strong> and <strong>permanently delete</strong> the project directory:</p>
+    <p><code id="m-dir"></code></p>
+    <p>To confirm, type <code>DELETE</code> below:</p>
+    <form id="m-form" method="POST">
+      <input type="hidden" name="confirm" value="DELETE" />
+      <input id="m-input" type="text" placeholder="DELETE" autocomplete="off" spellcheck="false" oninput="onConfirmInput()" />
+      <div class="modal-actions">
+        <button type="button" onclick="closeModal()">Cancel</button>
+        <button type="submit" id="m-go" class="btn project-delete" disabled>Delete forever</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script src="/static/dashboard.js"></script>
+</body>
+</html>

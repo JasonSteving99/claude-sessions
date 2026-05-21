@@ -2,25 +2,43 @@
 """Claude session manager — FastAPI + ttyd + tmux + SQLite."""
 import asyncio
 import json
+import os
 import socket
 import sqlite3
 import subprocess
+import sys
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 
 import httpx
 import websockets
 from fastapi import FastAPI, Form, Request, WebSocket
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 import uvicorn
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    PROJECT_BASE.mkdir(parents=True, exist_ok=True)
+    _db_init()
+    for name, info in _tmux_status().items():
+        _db_add(name, name, str(PROJECT_BASE / name), info["created"])
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="templates")
 
 TMUX          = "/usr/bin/tmux"
 TTYD          = "/usr/bin/ttyd"
 CLAUDE        = "/home/agent/.local/bin/claude"
-PROJECT_BASE  = Path("/home/agent/projects")
+# Project dirs live inside the sandbox's workspace mount so generated files are
+# host-visible. SANDBOX_DIR is validated by _require_sandbox() before use.
+PROJECT_BASE  = Path(os.environ.get("SANDBOX_DIR", "/var/empty")) / "projects"
 CLAUDE_PROJECTS = Path("/home/agent/.claude/projects")
 DB_PATH       = Path("/home/agent/.session-manager.db")
 
@@ -47,6 +65,7 @@ def _db_init() -> None:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS sessions (
                 name               TEXT PRIMARY KEY,
+                project            TEXT NOT NULL,
                 project_dir        TEXT NOT NULL,
                 created_at         INTEGER NOT NULL,
                 claude_project_key TEXT,
@@ -65,11 +84,25 @@ def _db_get(name: str) -> sqlite3.Row | None:
         return conn.execute("SELECT * FROM sessions WHERE name=?", (name,)).fetchone()
 
 
-def _db_add(name: str, project_dir: str, created_at: int = 0) -> None:
+def _next_session_name(project: str) -> str:
+    """Return a unique session name for the given project: 'foo', 'foo-2', 'foo-3', ..."""
+    with _db() as conn:
+        existing = {r["name"] for r in conn.execute(
+            "SELECT name FROM sessions WHERE project=?", (project,)
+        ).fetchall()}
+    if project not in existing:
+        return project
+    n = 2
+    while f"{project}-{n}" in existing:
+        n += 1
+    return f"{project}-{n}"
+
+
+def _db_add(name: str, project: str, project_dir: str, created_at: int = 0) -> None:
     with _db() as conn:
         conn.execute(
-            "INSERT OR IGNORE INTO sessions (name, project_dir, created_at) VALUES (?,?,?)",
-            (name, project_dir, created_at or int(time.time())),
+            "INSERT OR IGNORE INTO sessions (name, project, project_dir, created_at) VALUES (?,?,?,?)",
+            (name, project, project_dir, created_at or int(time.time())),
         )
 
 
@@ -88,8 +121,8 @@ def _db_remove(name: str) -> None:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _project_dir(name: str) -> Path:
-    d = PROJECT_BASE / name
+def _project_dir(project: str) -> Path:
+    d = PROJECT_BASE / project
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -144,8 +177,8 @@ def _tmux_status() -> dict[str, dict]:
     return out
 
 
-async def _new_tmux_session(name: str) -> None:
-    project_dir = str(_project_dir(name))
+async def _new_tmux_session(name: str, project: str) -> None:
+    project_dir = str(_project_dir(project))
     subprocess.run([TMUX, "new-session", "-d", "-s", name, "-c", project_dir], check=True)
     # cd explicitly: tmux -c silently falls back to $HOME if the dir doesn't exist
     subprocess.run([TMUX, "send-keys", "-t", name,
@@ -193,13 +226,16 @@ async def _detect_claude_session(name: str, created_at: int, snapshot: set[Path]
 
 # ── Usage scraping ────────────────────────────────────────────────────────────
 
-def _scrape_usage(project_key: str | None, session_id: str | None) -> dict:
+def _scrape_session_data(project_key: str | None, session_id: str | None) -> dict:
+    """Return title + usage stats scraped from the session's claude jsonl file."""
     if not project_key or not session_id:
         return {}
     jsonl = CLAUDE_PROJECTS / project_key / f"{session_id}.jsonl"
     if not jsonl.exists():
         return {}
 
+    first_user_msg = None
+    custom_title = None
     total_in = total_out = cache_read = cache_write = 0
     latest_ctx = 0
     latest_model = None
@@ -213,7 +249,23 @@ def _scrape_usage(project_key: str | None, session_id: str | None) -> dict:
                     obj = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
-                if obj.get("type") != "assistant":
+                t = obj.get("type")
+                # /rename writes a `custom-title` entry; last one wins.
+                if t == "custom-title":
+                    ct = obj.get("customTitle")
+                    if isinstance(ct, str) and ct.strip():
+                        custom_title = ct.strip()
+                # First real user message → fallback session title. Skip Claude Code's
+                # auto-generated entries: <bash-input>/<bash-stdout>/<bash-stderr>,
+                # <local-command-caveat>, <command-name>, etc. — they're regular user
+                # messages without isMeta:true, but their content starts with `<tag>`.
+                if first_user_msg is None and t == "user" and not obj.get("isMeta"):
+                    content = obj.get("message", {}).get("content", "")
+                    if isinstance(content, str):
+                        stripped = content.strip()
+                        if stripped and not stripped.startswith("<"):
+                            first_user_msg = stripped
+                if t != "assistant":
                     continue
                 usage = obj.get("message", {}).get("usage", {})
                 if not usage:
@@ -233,18 +285,24 @@ def _scrape_usage(project_key: str | None, session_id: str | None) -> dict:
     except Exception:
         pass
 
-    if not total_in and not total_out:
-        return {}
-    max_ctx = CONTEXT_MAX.get(latest_model, 200_000)
-    ctx_pct = round(latest_ctx / max_ctx * 100, 1) if latest_ctx else 0
-    return {
-        "in":         _fmt(total_in),
-        "out":        _fmt(total_out),
-        "cache_read": _fmt(cache_read),
-        "ctx":        _fmt(latest_ctx),
-        "max_ctx":    _fmt(max_ctx),
-        "ctx_pct":    ctx_pct,
-    }
+    result: dict = {}
+    title = custom_title or first_user_msg
+    if title:
+        # Compact for display: collapse whitespace, truncate
+        flat = " ".join(title.split())
+        result["title"] = flat[:80] + ("…" if len(flat) > 80 else "")
+    if total_in or total_out:
+        max_ctx = CONTEXT_MAX.get(latest_model, 200_000)
+        ctx_pct = round(latest_ctx / max_ctx * 100, 1) if latest_ctx else 0
+        result["usage"] = {
+            "in":         _fmt(total_in),
+            "out":        _fmt(total_out),
+            "cache_read": _fmt(cache_read),
+            "ctx":        _fmt(latest_ctx),
+            "max_ctx":    _fmt(max_ctx),
+            "ctx_pct":    ctx_pct,
+        }
+    return result
 
 
 # ── ttyd proxy ────────────────────────────────────────────────────────────────
@@ -272,75 +330,7 @@ async def _ensure_ttyd(name: str) -> int:
     return port
 
 
-# ── HTML ──────────────────────────────────────────────────────────────────────
-
-STYLE = """\
-<style>
-*, *::before, *::after { box-sizing: border-box; }
-body { font-family: 'SF Mono','Fira Code',ui-monospace,monospace;
-       background: #0d1117; color: #c9d1d9; margin: 0; padding: 2rem; }
-header { display: flex; align-items: baseline; gap: 1rem; margin-bottom: 2rem; }
-h1 { color: #58a6ff; font-size: 1.35rem; margin: 0; }
-.hint { color: #484f58; font-size: 0.78rem; }
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
-        gap: 0.75rem; margin-bottom: 2rem; }
-.card { background: #161b22; border: 1px solid #30363d; border-radius: 8px;
-        padding: 1rem 1.1rem; display: flex; flex-direction: column; gap: 0.55rem; }
-.card.stopped { opacity: 0.55; }
-.card-top { display: flex; align-items: center; justify-content: space-between; }
-.card-title { display: flex; align-items: center; gap: 0.5rem; }
-.dot { width: 8px; height: 8px; border-radius: 50%; background: #3fb950; flex-shrink: 0; }
-.dot.idle    { background: #484f58; }
-.dot.stopped { background: #da3633; }
-.sname { font-weight: bold; color: #58a6ff; font-size: 1rem; }
-.stopped .sname { color: #8b949e; }
-.actions { display: flex; gap: 0.4rem; }
-.card-dir { color: #484f58; font-size: 0.78rem; }
-.meta { display: grid; grid-template-columns: 1fr 1fr; gap: 0.25rem 1.5rem;
-        border-top: 1px solid #21262d; padding-top: 0.55rem; }
-.mi { display: flex; gap: 0.4rem; align-items: baseline; font-size: 0.82rem; }
-.ml { color: #484f58; min-width: 3.5rem; flex-shrink: 0; }
-.mv { color: #8b949e; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.mv.cmd-claude  { color: #3fb950; }
-.mv.cmd-shell   { color: #8b949e; }
-.mv.cmd-other   { color: #e3b341; }
-.mv.views-live  { color: #58a6ff; }
-.usage { border-top: 1px solid #21262d; padding-top: 0.55rem;
-         display: flex; flex-direction: column; gap: 0.3rem; }
-.usage-row { display: flex; gap: 1rem; font-size: 0.82rem; flex-wrap: wrap; }
-.ustat { display: flex; gap: 0.35rem; }
-.ul { color: #484f58; }
-.uv { color: #8b949e; }
-.uv.dim { color: #3d444d; }
-.ctx-wrap { display: flex; align-items: center; gap: 0.5rem; font-size: 0.82rem; }
-.ctx-bar { flex: 1; height: 4px; background: #21262d; border-radius: 2px; min-width: 60px; }
-.ctx-fill { height: 100%; border-radius: 2px; background: #58a6ff; }
-.ctx-fill.warn   { background: #e3b341; }
-.ctx-fill.danger { background: #da3633; }
-.ctx-label { color: #8b949e; white-space: nowrap; }
-.no-usage { color: #2d333b; font-size: 0.78rem; font-style: italic; }
-.btn { padding: 0.28rem 0.75rem; border: 1px solid; border-radius: 5px; cursor: pointer;
-       font-family: inherit; font-size: 0.8rem; text-decoration: none;
-       display: inline-block; white-space: nowrap; }
-.open   { background: #0d4429; border-color: #3fb950; color: #3fb950; }
-.open:hover { background: #144620; }
-.kill   { background: #2d1117; border-color: #da3633; color: #da3633; }
-.kill:hover { background: #3d1a17; }
-.create { background: #0c2d6b; border-color: #58a6ff; color: #58a6ff; padding: 0.45rem 1.3rem; }
-.create:hover { background: #0e3a87; }
-.empty { color: #484f58; font-style: italic; margin: 0.5rem 0 2rem; }
-form.new { background: #161b22; border: 1px solid #30363d; border-radius: 8px;
-           padding: 1.4rem; max-width: 400px; }
-form.new h2 { margin: 0 0 1.1rem; font-size: 0.9rem; color: #8b949e; font-weight: normal; }
-.field { margin-bottom: 0.9rem; }
-label { display: block; font-size: 0.76rem; color: #8b949e; margin-bottom: 0.25rem; }
-.field-hint { font-size: 0.72rem; color: #484f58; margin-top: 0.25rem; }
-input[type=text] { width: 100%; background: #0d1117; border: 1px solid #30363d;
-                   color: #c9d1d9; padding: 0.4rem 0.65rem; border-radius: 5px;
-                   font-family: inherit; font-size: 0.88rem; }
-input[type=text]:focus { outline: none; border-color: #58a6ff; }
-</style>"""
-
+# ── View context ──────────────────────────────────────────────────────────────
 
 def _cmd_class(command: str) -> str:
     if command == "claude":           return "cmd-claude"
@@ -348,111 +338,90 @@ def _cmd_class(command: str) -> str:
     return "cmd-other"
 
 
-def _render_landing(db_sessions: list, tmux: dict[str, dict]) -> str:
-    cards = ""
+def _build_session_ctx(s, tmux: dict[str, dict]) -> dict:
+    """Build the template context dict for a single session card."""
+    name = s["name"]
+    live = name in tmux
+    tm   = tmux.get(name, {})
+    conn = _registry.get(name, {}).get("connections", 0)
+
+    data = _scrape_session_data(s["claude_project_key"], s["claude_session_id"])
+    usage = None
+    u = data.get("usage")
+    if u:
+        ctx_pct = u["ctx_pct"]
+        fill_cls = ("ctx-fill danger" if ctx_pct >= 80
+                    else "ctx-fill warn" if ctx_pct >= 60
+                    else "ctx-fill")
+        usage = {
+            **u,
+            "fill_cls":  fill_cls,
+            "ctx_width": min(ctx_pct, 100),
+        }
+
+    return {
+        "name":         name,
+        "live":         live,
+        "card_cls":     "card" if live else "card stopped",
+        "dot_cls":      ("dot" if conn > 0 else "dot idle") if live else "dot stopped",
+        "cmd":          tm.get("command", "—"),
+        "cmd_cls":      _cmd_class(tm.get("command", "—")),
+        "views_cls":    "views-live" if conn > 0 else "",
+        "views_label":  f"{conn} active" if conn > 0 else "none",
+        "created_rel":  _rel(s["created_at"]),
+        "activity_rel": tm.get("activity_rel", "—"),
+        "title":        data.get("title"),
+        "usage":        usage,
+    }
+
+
+def _build_projects_ctx(db_sessions: list, tmux: dict[str, dict]) -> list[dict]:
+    """Group sessions by project (preserving creation order) and build template context."""
+    by_project: dict[str, list] = {}
     for s in db_sessions:
-        name = s["name"]
-        live = name in tmux
-        tm   = tmux.get(name, {})
-        conn = _registry.get(name, {}).get("connections", 0)
+        by_project.setdefault(s["project"], []).append(s)
 
-        dot_cls  = ("dot" if conn > 0 else "dot idle") if live else "dot stopped"
-        card_cls = "card" if live else "card stopped"
-        cmd      = tm.get("command", "—")
-        cmd_cls  = _cmd_class(cmd)
-        views_cls  = "views-live" if conn > 0 else ""
-        views_label = f"{conn} active" if conn > 0 else "none"
-
-        u = _scrape_usage(s["claude_project_key"], s["claude_session_id"])
-        if u:
-            ctx_pct   = u["ctx_pct"]
-            fill_cls  = ("ctx-fill danger" if ctx_pct >= 80
-                         else "ctx-fill warn" if ctx_pct >= 60
-                         else "ctx-fill")
-            usage_html = f"""
-      <div class="usage">
-        <div class="usage-row">
-          <div class="ustat"><span class="ul">in</span><span class="uv">{u['in']}</span></div>
-          <div class="ustat"><span class="ul">out</span><span class="uv">{u['out']}</span></div>
-          <div class="ustat"><span class="ul">cache↑</span><span class="uv dim">{u['cache_read']}</span></div>
-        </div>
-        <div class="ctx-wrap">
-          <span class="ul">ctx</span>
-          <div class="ctx-bar"><div class="{fill_cls}" style="width:{min(ctx_pct,100)}%"></div></div>
-          <span class="ctx-label">{u['ctx']} / {u['max_ctx']} ({ctx_pct}%)</span>
-        </div>
-      </div>"""
-        else:
-            usage_html = '<div class="usage"><span class="no-usage">no usage data yet</span></div>'
-
-        open_btn = (f'<a class="btn open" href="/sessions/{name}/" target="_blank">Open ↗</a>'
-                    if live else '<span style="color:#484f58;font-size:0.8rem">stopped</span>')
-
-        cards += f"""
-    <div class="{card_cls}">
-      <div class="card-top">
-        <div class="card-title">
-          <div class="{dot_cls}"></div>
-          <span class="sname">{name}</span>
-        </div>
-        <div class="actions">
-          {open_btn}
-          <form method="POST" action="/sessions/{name}/kill" style="margin:0">
-            <button type="submit" class="btn kill">Kill</button>
-          </form>
-        </div>
-      </div>
-      <div class="card-dir">{s['project_dir']}</div>
-      <div class="meta">
-        <div class="mi"><span class="ml">cmd</span><span class="mv {cmd_cls}">{cmd}</span></div>
-        <div class="mi"><span class="ml">created</span><span class="mv">{_rel(s['created_at'])}</span></div>
-        <div class="mi"><span class="ml">views</span><span class="mv {views_cls}">{views_label}</span></div>
-        <div class="mi"><span class="ml">activity</span><span class="mv">{tm.get('activity_rel','—')}</span></div>
-      </div>{usage_html}
-    </div>"""
-
-    if not cards:
-        cards = '<p class="empty">No sessions yet. Create one below.</p>'
-
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta http-equiv="refresh" content="15">
-  <title>Claude Sessions</title>
-  {STYLE}
-</head>
-<body>
-<header>
-  <h1>Claude Sessions</h1>
-  <span class="hint">auto-refreshes every 15s</span>
-</header>
-<div class="grid">{cards}</div>
-<form class="new" method="POST" action="/sessions">
-  <h2>New session</h2>
-  <div class="field">
-    <label>Project name</label>
-    <input type="text" name="name" placeholder="my-project" required autofocus />
-    <div class="field-hint">Creates /home/agent/projects/{{name}}</div>
-  </div>
-  <button type="submit" class="btn create">Create &amp; Open</button>
-</form>
-</body>
-</html>"""
+    projects: list[dict] = []
+    for project, sessions in by_project.items():
+        count = len(sessions)
+        projects.append({
+            "project":     project,
+            "project_dir": sessions[0]["project_dir"],
+            "count":       count,
+            "suffix":      "s" if count != 1 else "",
+            "sessions":    [_build_session_ctx(s, tmux) for s in sessions],
+        })
+    return projects
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
-@app.get("/", response_class=HTMLResponse)
-async def landing():
-    return _render_landing(_db_all(), _tmux_status())
+@app.get("/")
+async def landing(request: Request):
+    return templates.TemplateResponse(request, "dashboard.html", {
+        "projects":     _build_projects_ctx(_db_all(), _tmux_status()),
+        "project_base": str(PROJECT_BASE),
+    })
+
+
+@app.get("/partial/groups")
+async def partial_groups(request: Request):
+    """Just the project groups HTML, for live in-page refresh from JS."""
+    return templates.TemplateResponse(request, "groups.html", {
+        "projects":     _build_projects_ctx(_db_all(), _tmux_status()),
+        "project_base": str(PROJECT_BASE),
+    })
 
 
 @app.post("/sessions")
 async def create_session(name: str = Form(...)):
-    project_dir = str(_project_dir(name))
-    created_at  = int(time.time())
-    _db_add(name, project_dir)
+    # The form field is the *project* name; the session name may be auto-suffixed
+    # (e.g. "frontend-2") when multiple sessions share the same project dir.
+    project = name
+    session_name = _next_session_name(project)
+    project_dir = str(_project_dir(project))
+    created_at = int(time.time())
+    _db_add(session_name, project, project_dir, created_at)
 
     # Snapshot existing jsonl files so detection only picks up new ones
     snapshot: set[Path] = set()
@@ -461,12 +430,12 @@ async def create_session(name: str = Form(...)):
             if d.is_dir():
                 snapshot.update(d.glob("*.jsonl"))
 
-    if name not in _tmux_status():
-        await _new_tmux_session(name)
-    await _ensure_ttyd(name)
+    if session_name not in _tmux_status():
+        await _new_tmux_session(session_name, project)
+    await _ensure_ttyd(session_name)
 
-    asyncio.create_task(_detect_claude_session(name, created_at, snapshot))
-    return RedirectResponse(f"/sessions/{name}/", status_code=303)
+    asyncio.create_task(_detect_claude_session(session_name, created_at, snapshot))
+    return RedirectResponse(f"/sessions/{session_name}/", status_code=303)
 
 
 @app.post("/sessions/{name}/kill")
@@ -476,6 +445,28 @@ async def kill_session(name: str):
         entry["proc"].terminate()
     subprocess.run([TMUX, "kill-session", "-t", name], capture_output=True)
     _db_remove(name)
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/projects/{project}/destroy")
+async def destroy_project(project: str, confirm: str = Form("")):
+    # Belt-and-suspenders: refuse without the typed confirmation, even though the
+    # UI gates the button. Keeps curl/scripts from accidentally nuking a project.
+    if confirm != "DELETE":
+        return Response("missing or wrong confirmation token", status_code=400)
+    project_dir = None
+    sessions = [r for r in _db_all() if r["project"] == project]
+    for s in sessions:
+        n = s["name"]
+        project_dir = s["project_dir"]
+        entry = _registry.pop(n, None)
+        if entry:
+            entry["proc"].terminate()
+        subprocess.run([TMUX, "kill-session", "-t", n], capture_output=True)
+        _db_remove(n)
+    if project_dir:
+        import shutil
+        shutil.rmtree(project_dir, ignore_errors=True)
     return RedirectResponse("/", status_code=303)
 
 
@@ -535,16 +526,25 @@ async def http_proxy(name: str, path: str, request: Request):
         return Response(content=r.content, status_code=r.status_code, headers=headers)
 
 
-# ── Startup ───────────────────────────────────────────────────────────────────
-
-@app.on_event("startup")
-async def startup():
-    PROJECT_BASE.mkdir(parents=True, exist_ok=True)
-    _db_init()
-    tmux = _tmux_status()
-    for name, info in tmux.items():
-        _db_add(name, str(PROJECT_BASE / name), info["created"])
+def _require_sandbox() -> None:
+    """Refuse to run outside an sbx microvm — Claude is launched with
+    --dangerously-skip-permissions, which is only safe inside the sandbox."""
+    if not os.environ.get("SANDBOX_VM_ID"):
+        sys.exit(
+            "refusing to start: $SANDBOX_VM_ID is not set, so this process is not "
+            "running inside an sbx microvm. claude-sessions launches Claude with "
+            "--dangerously-skip-permissions on behalf of anyone who can reach the "
+            "dashboard, which is only safe inside the sandbox isolation boundary."
+        )
+    if not os.environ.get("SANDBOX_DIR"):
+        sys.exit(
+            "refusing to start: $SANDBOX_DIR is not set. The justfile sets this from "
+            ".env and propagates it into the sandbox; this process is missing it, "
+            "which suggests it was launched outside the normal `just up` flow."
+        )
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=3000, log_level="warning")
+    _require_sandbox()
+    port = int(os.environ.get("PORT", "3000"))
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
