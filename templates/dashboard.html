@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <title>Claude Sessions</title>
+  <meta name="host-daemon-port" content="{{ host_port }}">
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
@@ -44,6 +45,26 @@
       <div class="modal-actions">
         <button type="button" onclick="closeModal()">Cancel</button>
         <button type="submit" id="m-go" class="btn project-delete" disabled>Delete forever</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div id="port-modal" class="modal-bg" style="display:none" onclick="if(event.target.id==='port-modal')closePortModal()">
+  <div class="modal-card">
+    <h2>Expose a port</h2>
+    <p>Publish a port from this sandbox to <code>127.0.0.1</code> on the host so you can reach a server running in <strong id="p-project"></strong>.</p>
+    <p class="modal-hint">The host daemon (not the sandbox) executes <code>sbx ports --publish</code>. The sandbox never invokes this directly.</p>
+    <form id="p-form" onsubmit="submitAddPort(event)">
+      <label class="port-field">
+        <span>Port</span>
+        <input id="p-input" type="number" min="1" max="65535" placeholder="8080"
+               autocomplete="off" required oninput="onPortInput()" />
+      </label>
+      <div id="p-error" class="port-error" style="display:none"></div>
+      <div class="modal-actions">
+        <button type="button" onclick="closePortModal()">Cancel</button>
+        <button type="submit" id="p-go" class="btn create" disabled>Expose</button>
       </div>
     </form>
   </div>

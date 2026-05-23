@@ -401,6 +401,7 @@ async def landing(request: Request):
     return templates.TemplateResponse(request, "dashboard.html", {
         "projects":     _build_projects_ctx(_db_all(), _tmux_status()),
         "project_base": str(PROJECT_BASE),
+        "host_port":    int(os.environ.get("HOST_PORT", "33001")),
     })
 
 

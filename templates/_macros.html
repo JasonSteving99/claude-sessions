@@ -44,7 +44,7 @@
 {% endmacro %}
 
 {% macro render_project_group(p) %}
-    <section class="project-group">
+    <section class="project-group" data-project="{{ p.project }}">
       <header class="project-header">
         <div class="project-id">
           <div class="project-id-left">
@@ -52,6 +52,9 @@
             <span class="project-count">{{ p.count }} session{{ p.suffix }}</span>
           </div>
           <div class="project-actions">
+            <button type="button" class="btn add-port"
+                    data-project="{{ p.project }}"
+                    onclick="openAddPort(this)">+ Port</button>
             <form method="POST" action="/sessions" target="_blank" style="margin:0">
               <input type="hidden" name="name" value="{{ p.project }}" />
               <button type="submit" class="btn add-session">+ Session</button>
@@ -65,6 +68,7 @@
         </div>
         <div class="project-dir">{{ p.project_dir }}</div>
       </header>
+      <div class="ports-panel" data-project="{{ p.project }}"></div>
       <div class="project-sessions">
         {% for s in p.sessions %}{{ render_card(s) }}{% endfor %}
       </div>

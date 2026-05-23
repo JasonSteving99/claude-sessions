@@ -17,8 +17,9 @@ These must already be installed on the host machine:
 - **`sbx` CLI** — Docker Sandboxes
   (<https://docs.docker.com/ai/sandboxes/>)
 - **`just`** — the command runner used to drive the project
-- **`uv`** — Python package manager. Only needed *inside* the sandbox; `just up`
-  invokes it via `sbx exec`, so you do not need it on the host.
+- **`uv`** — Python package manager. Needed on the host to run the port
+  daemon (see [Exposing ports](#exposing-ports)), and also used inside the
+  sandbox to run the dashboard server.
 
 > [!NOTE]
 > **TODO:** `just up` should detect missing host prerequisites (`docker`,
@@ -54,8 +55,9 @@ Then open <http://127.0.0.1:3000> (or `127.0.0.1:$PORT`).
 SANDBOX_NAME=claude-sessions
 SANDBOX_DIR=/path/to/your/workspace
 
-# Optional (default 3000)
-PORT=3000
+# Optional
+PORT=3000        # dashboard port (default 3000)
+HOST_PORT=33001  # host daemon port for dynamic port exposure (default 33001)
 ```
 
 - `SANDBOX_NAME` is the `sbx` sandbox identifier. Any string; created on first
@@ -83,14 +85,18 @@ Idempotent bring-up. In order:
    (disowned from the shell so it survives `just up` exiting). The host-side
    exec process is what keeps the sandbox from being auto-stopped by `sbx`.
 4. Publishes the dashboard port: `sbx ports $SANDBOX_NAME --publish $PORT:$PORT`.
+5. Starts the **host daemon** (`host_daemon.py`) on `127.0.0.1:$HOST_PORT`.
+   This process — and only this process — invokes `sbx ports --publish` for
+   ports the user requests via the dashboard. See [Exposing ports](#exposing-ports).
 
 Safe to re-run; each step is a no-op if already done.
 
 ### `just down`
 
-Clean shutdown. Kills the in-sandbox server (`fuser -k $PORT/tcp`), terminates
-the host-side `sbx exec` sessions (which allows `sbx` to auto-stop the
-sandbox), and unpublishes the port. Idempotent.
+Clean shutdown. SIGTERMs the host daemon first so it can unpublish every
+managed port; then kills the in-sandbox server (`fuser -k $PORT/tcp`),
+terminates the host-side `sbx exec` sessions (which allows `sbx` to
+auto-stop the sandbox), and unpublishes the dashboard port. Idempotent.
 
 ### `just restart`
 
@@ -105,6 +111,50 @@ and the currently-published ports for the sandbox.
 
 `tail -f /tmp/sbx-serve.log` — the host-side capture of the in-sandbox server's
 stdout/stderr.
+
+### `just logs-host`
+
+`tail -f /tmp/host-daemon.log` — the host-side port daemon's stdout/stderr.
+
+## Exposing ports
+
+Each project card in the dashboard has a **+ Port** button. Use it to publish
+a port from the sandbox to `127.0.0.1` on the host so a server Claude built
+in that project (a dev server, a database, anything bound to `0.0.0.0`
+inside the sandbox) is reachable from your browser at `http://127.0.0.1:<port>`.
+
+### Trust model
+
+`sbx ports --publish` can only be invoked from the host. The naive design
+would be to have the sandbox dashboard call out to a host-side helper —
+but that creates a control plane the sandbox can drive, which is exactly
+what we're trying to avoid (Claude runs with `--dangerously-skip-permissions`,
+and anything Claude can run inside the sandbox could then arbitrarily
+expose host ports).
+
+So the sandbox and the host daemon **never communicate**. The browser is the
+trusted bridge:
+
+- The dashboard HTML is served by the sandbox at `http://127.0.0.1:$PORT`.
+- The dashboard's JS calls the host daemon at `http://127.0.0.1:$HOST_PORT`
+  directly to add or remove ports.
+- The host daemon binds **loopback only**. Its CORS config allows only the
+  dashboard's origin, and writes require `Content-Type: application/json`
+  so cross-origin requests trigger a preflight that other sites can't pass.
+- The sandbox has no way to reach the host daemon — there is no network
+  path back from inside the sandbox to a loopback-bound host process.
+
+The host daemon persists state at `$SANDBOX_DIR/.host-daemon-state.json`.
+On startup it reconciles published ports against that state (recovering
+orphans from a hard crash); on graceful shutdown (`just down`) it
+unpublishes everything it owns and clears the state file — the processes
+the ports pointed at are about to die anyway.
+
+> [!NOTE]
+> **TODO (fast follow):** make this work over Tailscale. The host daemon
+> currently binds loopback only, so phone access through `tailscale serve`
+> reaches the dashboard but not the port daemon. The plan is a second
+> `tailscale serve` mapping (or path-based routing) for `$HOST_PORT`.
 
 ## Security model
 
@@ -171,12 +221,17 @@ can:
 
 ```
 browser
-  │  HTTPS (tailnet, optional)        ws/http on 127.0.0.1:$PORT
-  ▼                                   ▲
-host (macOS)  ── sbx ports --publish ─┘
+  │  http://127.0.0.1:$PORT       (dashboard, sessions, ttyd proxy)
+  │  http://127.0.0.1:$HOST_PORT  (ports API — host daemon only)
+  ▼
+host (macOS)
+  ├─ host_daemon.py  (127.0.0.1:$HOST_PORT)
+  │     • only process that invokes `sbx ports --publish/--unpublish`
+  │     • state: $SANDBOX_DIR/.host-daemon-state.json
+  │     • sandbox cannot reach this — browser is the only client
   │
-  └─ sbx microvm ($SANDBOX_VM_ID)
-       │
+  └─ sbx microvm ($SANDBOX_VM_ID)         ↑
+       │                                  │  sbx ports --publish
        ├─ FastAPI app (main.py, 0.0.0.0:$PORT)
        │     • routes:    /  /partial/groups  /sessions  /sessions/{n}/{kill,ws,*}
        │     • WS proxy:  /sessions/{n}/ws  →  ws://127.0.0.1:<ttyd-port>/ws
