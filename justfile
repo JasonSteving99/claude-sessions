@@ -73,9 +73,9 @@ up:
             echo "warning: TAILSCALE is set but 'tailscale' is not on PATH — skipping tailnet serve" >&2; \
         else \
             echo "tailscale: serving dashboard at http://<tailnet>:${PORT}..."; \
-            tailscale serve --http=${PORT} "http://localhost:${PORT}" 2>&1 || true; \
+            tailscale serve --bg --http=${PORT} "http://127.0.0.1:${PORT}" 2>&1 || true; \
             echo "tailscale: serving host daemon at http://<tailnet>:${HOST_PORT:-33001}..."; \
-            tailscale serve --http=${HOST_PORT:-33001} "http://localhost:${HOST_PORT:-33001}" 2>&1 || true; \
+            tailscale serve --bg --http=${HOST_PORT:-33001} "http://127.0.0.1:${HOST_PORT:-33001}" 2>&1 || true; \
             tsname=$(tailscale status --self --json 2>/dev/null | sed -n 's/.*"DNSName":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1 | sed 's/\.$//'); \
             [ -n "$tsname" ] && echo "→ tailnet: http://${tsname}:${PORT}"; \
         fi; \

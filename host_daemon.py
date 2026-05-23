@@ -96,8 +96,8 @@ async def _tailscale_serve(port: int) -> None:
     might be off, the binary missing, the device not logged in, etc."""
     if not TAILSCALE_ENABLED:
         return
-    rc, _, err = await _run("tailscale", "serve", f"--http={port}",
-                            f"http://localhost:{port}")
+    rc, _, err = await _run("tailscale", "serve", "--bg", f"--http={port}",
+                            f"http://127.0.0.1:{port}")
     if rc != 0:
         print(f"[host-daemon] tailscale serve --http={port}: {err.strip() or 'failed'}",
               file=sys.stderr)
