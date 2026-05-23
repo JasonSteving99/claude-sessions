@@ -151,13 +151,58 @@ orphans from a hard crash); on graceful shutdown (`just down`) it
 unpublishes everything it owns and clears the state file — the processes
 the ports pointed at are about to die anyway.
 
-### Tailscale: mobile access
 
-Set `TAILSCALE=1` in `.env` to make every exposed port — plus the dashboard
-and the host daemon itself — reachable on your tailnet, so the dashboard
-works from your phone. When set, `just up`:
+## Security model
 
-- runs `tailscale serve --http=$PORT http://localhost:$PORT` for the
+- Sessions launch `claude --dangerously-skip-permissions`, which would normally
+  be a footgun. It is only safe here because **everything runs inside the
+  `sbx` microvm**. `main.py`'s `_require_sandbox()` guard refuses to start if
+  `$SANDBOX_VM_ID` is unset, so the server cannot accidentally be run on the
+  host. The same check requires `$SANDBOX_DIR` to be set.
+- The dashboard binds to `0.0.0.0:$PORT` *inside* the sandbox. `sbx ports
+  --publish` exposes it on the host as `127.0.0.1:$PORT` (loopback only), so
+  it is not reachable from other machines on your LAN unless you explicitly
+  forward it (see [Tailscale: phone and multi-device access](#tailscale-phone-and-multi-device-access)).
+- The codebase is mounted **read-only** into the sandbox; `$SANDBOX_DIR` is
+  mounted read-write. Files Claude creates in `$SANDBOX_DIR/projects/<name>/`
+  are visible on the host so you can open, edit, and commit them with your
+  usual tools.
+- The per-session `ttyd` instances bind to `127.0.0.1` inside the sandbox.
+  They are not directly reachable from the host; the FastAPI app is the only
+  entry point and it WebSocket-proxies traffic to the right `ttyd` based on
+  the URL path.
+
+## Tailscale: phone and multi-device access
+
+Set `TAILSCALE=1` in `.env` to make every exposed port — the dashboard,
+the host daemon, and any port you publish via the **+ Port** button —
+reachable on your tailnet from your phone, tablet, or any device you own,
+without opening a public port. Open `http://<hostname>:$PORT` on your phone
+and you have full-fidelity Claude Code in a browser tab, running on your
+hardware, with every session state-resumable from anywhere. Any server
+Claude builds inside a project is one tap away on the same screen.
+
+This gives you things that neither Anthropic's hosted Claude Code sandbox
+nor the mobile remote-control feature can:
+
+- **Your hardware, your code.** Files Claude creates live in
+  `$SANDBOX_DIR/projects/<name>/` on your Mac, ready to open in your IDE or
+  commit to git. Nothing is locked inside someone else's cloud sandbox.
+- **Long-running side effects.** Because the sandbox keeps running, Claude
+  can spin up a dev server, a database, or a background worker that you can
+  also reach over your tailnet for as long as you want. The hosted Claude
+  Code sandbox tears itself down between turns; this one doesn't.
+- **Claude built me a web app, and now it serves it to me.** With
+  `TAILSCALE=1`, any port the dashboard exposes is immediately reachable
+  on your phone over the same tailnet ingress — letting Claude build you a
+  tool and serve it back, persistently, over a network only your devices
+  can reach.
+
+### How it works
+
+When `TAILSCALE=1` is set, `just up`:
+
+- runs `tailscale serve --http=$PORT http://127.0.0.1:$PORT` for the
   dashboard,
 - runs the same for the host daemon at `$HOST_PORT`, and
 - has the host daemon do the same for every user-exposed port as it's
@@ -168,7 +213,12 @@ installed, not logged in, etc.) are logged but never block local
 operation — the dashboard stays fully usable on `127.0.0.1` regardless.
 
 The daemon also widens its CORS policy to accept `*.ts.net` origins when
-`TAILSCALE=1` is set; without it, the regex stays loopback-only.
+`TAILSCALE=1` is set; without it, the regex stays loopback-only. The trust
+boundary stays clean: Tailscale terminates on your Mac, the Mac forwards
+over loopback into the sandbox, and the sandbox never sees a Tailscale
+credential.
+
+### Setup
 
 **Prerequisites — you must have already done these on the host before
 setting `TAILSCALE=1`:**
@@ -185,73 +235,10 @@ setting `TAILSCALE=1`:**
    See [Tailscale's `serve` docs](https://tailscale.com/kb/1242/tailscale-serve)
    for the full setup walkthrough.
 3. **Confirm `tailscale serve` works at all** before flipping the flag.
-   Try `tailscale serve --http=8080 http://localhost:8080` against any
+   Try `tailscale serve --http=8080 http://127.0.0.1:8080` against any
    local server; if it errors out, fix that before enabling `TAILSCALE=1`
    here. `just up` is forgiving about failures (it'll print a warning and
    keep going on loopback-only), but it can't diagnose them for you.
-
-Once those are in place, `tailscale status` will show your tailnet
-hostname; the phone URL is `http://<hostname>:$PORT`.
-
-## Security model
-
-- Sessions launch `claude --dangerously-skip-permissions`, which would normally
-  be a footgun. It is only safe here because **everything runs inside the
-  `sbx` microvm**. `main.py`'s `_require_sandbox()` guard refuses to start if
-  `$SANDBOX_VM_ID` is unset, so the server cannot accidentally be run on the
-  host. The same check requires `$SANDBOX_DIR` to be set.
-- The dashboard binds to `0.0.0.0:$PORT` *inside* the sandbox. `sbx ports
-  --publish` exposes it on the host as `127.0.0.1:$PORT` (loopback only), so
-  it is not reachable from other machines on your LAN unless you explicitly
-  forward it (see the Tailscale section below).
-- The codebase is mounted **read-only** into the sandbox; `$SANDBOX_DIR` is
-  mounted read-write. Files Claude creates in `$SANDBOX_DIR/projects/<name>/`
-  are visible on the host so you can open, edit, and commit them with your
-  usual tools.
-- The per-session `ttyd` instances bind to `127.0.0.1` inside the sandbox.
-  They are not directly reachable from the host; the FastAPI app is the only
-  entry point and it WebSocket-proxies traffic to the right `ttyd` based on
-  the URL path.
-
-## Claude Code on your phone, on your hardware
-
-This is the part that makes the whole project worth it. Once your Mac is on a
-[Tailscale](https://tailscale.com) tailnet, set `TAILSCALE=1` in `.env` and
-`just up` exposes everything to every device you own — phone, tablet,
-second laptop — without opening a public port. The dashboard, the host
-daemon, and every port the dashboard publishes are all served on the
-tailnet at their respective ports (see [Tailscale: phone access](#tailscale-phone-access)
-above for the mechanics).
-
-Open the tailnet URL on your phone and you have full-fidelity Claude Code
-in a browser tab, running on your hardware, with every session
-state-resumable from anywhere — and any server Claude builds inside a
-project is one tap away on the same screen.
-
-The trust boundary stays clean: Tailscale terminates on your Mac, the Mac
-forwards over loopback into the sandbox, and the sandbox never sees a
-Tailscale credential. Devices that are *not* on your tailnet cannot reach
-the dashboard at all.
-
-### Why this matters
-
-This setup gives you things that neither Anthropic's hosted Claude Code
-sandbox nor the desktop-dispatch / remote-control feature in the mobile app
-can:
-
-- **Your hardware, your code.** Files Claude creates live in
-  `$SANDBOX_DIR/projects/<name>/` on your Mac, ready to open in your IDE or
-  commit to git. Nothing is locked inside someone else's cloud sandbox.
-- **Long-running side effects.** Because the sandbox keeps running, Claude
-  can spin up a dev server, a database, or a background worker that you can
-  also reach over your tailnet for as long as you want. The hosted Claude
-  Code sandbox tears itself down between turns; this one doesn't.
-- **Claude built me a web app, and now it serves it to me.** With
-  `TAILSCALE=1`, any port the dashboard exposes is immediately reachable
-  on your phone over the same tailnet ingress — letting Claude build you a
-  tool and serve it back, persistently, over a network only your devices
-  can reach. That's a workflow neither the cloud sandbox nor the mobile
-  remote control supports.
 
 ## Architecture
 
