@@ -7,7 +7,7 @@ proxies the WebSockets so only a single host port is exposed. The whole stack
 runs inside an `sbx` sandbox, which is the trust boundary that makes it safe to
 launch Claude with `--dangerously-skip-permissions` on your behalf.
 
-![Dashboard screenshot](assets/dashboard_screenshot.png)
+![Dashboard screenshot](assets/dashboard_screenshot_w_preview.png)
 
 ## Prerequisites
 
@@ -58,6 +58,7 @@ SANDBOX_DIR=/path/to/your/workspace
 # Optional
 PORT=3000        # dashboard port (default 3000)
 HOST_PORT=33001  # host daemon port for dynamic port exposure (default 33001)
+TAILSCALE=1      # opt-in tailnet serve for phone access (default off)
 ```
 
 - `SANDBOX_NAME` is the `sbx` sandbox identifier. Any string; created on first
@@ -150,11 +151,47 @@ orphans from a hard crash); on graceful shutdown (`just down`) it
 unpublishes everything it owns and clears the state file — the processes
 the ports pointed at are about to die anyway.
 
-> [!NOTE]
-> **TODO (fast follow):** make this work over Tailscale. The host daemon
-> currently binds loopback only, so phone access through `tailscale serve`
-> reaches the dashboard but not the port daemon. The plan is a second
-> `tailscale serve` mapping (or path-based routing) for `$HOST_PORT`.
+### Tailscale: mobile access
+
+Set `TAILSCALE=1` in `.env` to make every exposed port — plus the dashboard
+and the host daemon itself — reachable on your tailnet, so the dashboard
+works from your phone. When set, `just up`:
+
+- runs `tailscale serve --http=$PORT http://localhost:$PORT` for the
+  dashboard,
+- runs the same for the host daemon at `$HOST_PORT`, and
+- has the host daemon do the same for every user-exposed port as it's
+  added (and tear it down on remove).
+
+`just down` cleans up all of those serves. Failures (Tailscale not
+installed, not logged in, etc.) are logged but never block local
+operation — the dashboard stays fully usable on `127.0.0.1` regardless.
+
+The daemon also widens its CORS policy to accept `*.ts.net` origins when
+`TAILSCALE=1` is set; without it, the regex stays loopback-only.
+
+**Prerequisites — you must have already done these on the host before
+setting `TAILSCALE=1`:**
+
+1. **Install Tailscale** and sign in to your tailnet (`tailscale up`).
+   Verify with `tailscale status` — your machine should be listed.
+2. **Enable the `tailscale serve` feature for your tailnet.** This is a
+   one-time tailnet-level setting, not something `just up` can do for
+   you. In the [Tailscale admin console](https://login.tailscale.com/admin/dns):
+   - Enable **MagicDNS** (if not already on).
+   - Enable **HTTPS Certificates** — even though we use `--http=` and
+     never request a cert, the admin console gates the entire `tailscale
+     serve` subsystem behind this toggle.
+   See [Tailscale's `serve` docs](https://tailscale.com/kb/1242/tailscale-serve)
+   for the full setup walkthrough.
+3. **Confirm `tailscale serve` works at all** before flipping the flag.
+   Try `tailscale serve --http=8080 http://localhost:8080` against any
+   local server; if it errors out, fix that before enabling `TAILSCALE=1`
+   here. `just up` is forgiving about failures (it'll print a warning and
+   keep going on loopback-only), but it can't diagnose them for you.
+
+Once those are in place, `tailscale status` will show your tailnet
+hostname; the phone URL is `http://<hostname>:$PORT`.
 
 ## Security model
 
@@ -179,23 +216,22 @@ the ports pointed at are about to die anyway.
 ## Claude Code on your phone, on your hardware
 
 This is the part that makes the whole project worth it. Once your Mac is on a
-[Tailscale](https://tailscale.com) tailnet, one command exposes the dashboard
-to every device you own — phone, tablet, second laptop — without opening a
-public port:
+[Tailscale](https://tailscale.com) tailnet, set `TAILSCALE=1` in `.env` and
+`just up` exposes everything to every device you own — phone, tablet,
+second laptop — without opening a public port. The dashboard, the host
+daemon, and every port the dashboard publishes are all served on the
+tailnet at their respective ports (see [Tailscale: phone access](#tailscale-phone-access)
+above for the mechanics).
 
-```bash
-tailscale serve --bg http://localhost:3000
-```
-
-The dashboard now resolves at `https://<mac-name>.<tailnet>.ts.net` for any
-device on your tailnet. Open it on your phone and you have full-fidelity
-Claude Code in a browser tab, running on your hardware, with every session
-state-resumable from anywhere.
+Open the tailnet URL on your phone and you have full-fidelity Claude Code
+in a browser tab, running on your hardware, with every session
+state-resumable from anywhere — and any server Claude builds inside a
+project is one tap away on the same screen.
 
 The trust boundary stays clean: Tailscale terminates on your Mac, the Mac
 forwards over loopback into the sandbox, and the sandbox never sees a
-Tailscale credential. Devices that are *not* on your tailnet cannot reach the dashboard
-at all.
+Tailscale credential. Devices that are *not* on your tailnet cannot reach
+the dashboard at all.
 
 ### Why this matters
 
@@ -210,23 +246,26 @@ can:
   can spin up a dev server, a database, or a background worker that you can
   also reach over your tailnet for as long as you want. The hosted Claude
   Code sandbox tears itself down between turns; this one doesn't.
-- **A clear path to "Claude built me a web app, and now it serves it to me."**
-  In a future iteration, sessions can publish additional ports through the
-  same Tailscale ingress — letting Claude build you a tool and immediately
-  serve it back to you, persistently, over a network only your devices can
-  reach. That's a workflow neither the cloud sandbox nor the mobile remote
-  control can support.
+- **Claude built me a web app, and now it serves it to me.** With
+  `TAILSCALE=1`, any port the dashboard exposes is immediately reachable
+  on your phone over the same tailnet ingress — letting Claude build you a
+  tool and serve it back, persistently, over a network only your devices
+  can reach. That's a workflow neither the cloud sandbox nor the mobile
+  remote control supports.
 
 ## Architecture
 
 ```
-browser
-  │  http://127.0.0.1:$PORT       (dashboard, sessions, ttyd proxy)
-  │  http://127.0.0.1:$HOST_PORT  (ports API — host daemon only)
+browser (loopback OR tailnet)
+  │  http://(127.0.0.1 | <host>.<tailnet>.ts.net):$PORT       (dashboard / sessions / ttyd proxy)
+  │  http://(127.0.0.1 | <host>.<tailnet>.ts.net):$HOST_PORT  (ports API — host daemon only)
   ▼
 host (macOS)
+  ├─ tailscale serve  (only when TAILSCALE=1; forwards tailnet → loopback)
+  │
   ├─ host_daemon.py  (127.0.0.1:$HOST_PORT)
   │     • only process that invokes `sbx ports --publish/--unpublish`
+  │     • also runs `tailscale serve` per published port when TAILSCALE=1
   │     • state: $SANDBOX_DIR/.host-daemon-state.json
   │     • sandbox cannot reach this — browser is the only client
   │

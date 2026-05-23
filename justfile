@@ -10,6 +10,11 @@ set shell := ["bash", "-cu"]
 # Optional:
 #   PORT         — dashboard port (default 3000)
 #   HOST_PORT    — host-daemon port for dynamic port exposure (default 33001)
+#   TAILSCALE    — when non-empty, `just up` calls `tailscale serve` for the
+#                  dashboard + daemon, and the host daemon does the same for
+#                  every user-exposed port. Lets you reach everything from
+#                  your phone over the tailnet. Requires `tailscale` on the
+#                  host and `tailscale up` already done.
 
 CODE_DIR := justfile_directory()
 
@@ -58,6 +63,23 @@ up:
         echo "starting host daemon on 127.0.0.1:${HOST_PORT:-33001}..."; \
         uv run host_daemon.py > /tmp/host-daemon.log 2>&1 & disown; \
     fi
+    # Tailscale opt-in: expose the dashboard and the host daemon on the
+    # tailnet so the dashboard works from a phone. The host daemon takes care
+    # of `tailscale serve` for individual user-exposed ports as they come and
+    # go; the dashboard + daemon themselves are bootstrap-level so they live
+    # here. Failures (binary missing, not logged in, etc.) are warnings only.
+    @if [ -n "${TAILSCALE:-}" ]; then \
+        if ! command -v tailscale >/dev/null 2>&1; then \
+            echo "warning: TAILSCALE is set but 'tailscale' is not on PATH — skipping tailnet serve" >&2; \
+        else \
+            echo "tailscale: serving dashboard at http://<tailnet>:${PORT}..."; \
+            tailscale serve --http=${PORT} "http://localhost:${PORT}" 2>&1 || true; \
+            echo "tailscale: serving host daemon at http://<tailnet>:${HOST_PORT:-33001}..."; \
+            tailscale serve --http=${HOST_PORT:-33001} "http://localhost:${HOST_PORT:-33001}" 2>&1 || true; \
+            tsname=$(tailscale status --self --json 2>/dev/null | sed -n 's/.*"DNSName":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1 | sed 's/\.$//'); \
+            [ -n "$tsname" ] && echo "→ tailnet: http://${tsname}:${PORT}"; \
+        fi; \
+    fi
     @echo "→ http://127.0.0.1:${PORT}"
     @echo "  logs:  just logs        (sandbox server)"
     @echo "  logs:  just logs-host   (host daemon)"
@@ -90,6 +112,13 @@ down:
         sleep 1; \
     fi
     @sbx ports "$SANDBOX_NAME" --unpublish "${PORT}:${PORT}" 2>/dev/null || true
+    # Tear down dashboard + daemon tailnet serves we set up in `up`. The host
+    # daemon already unserved every user-exposed port during its SIGTERM
+    # handler above, so we only need to clean up the bootstrap ports here.
+    @if [ -n "${TAILSCALE:-}" ] && command -v tailscale >/dev/null 2>&1; then \
+        tailscale serve --http=${PORT} off 2>/dev/null || true; \
+        tailscale serve --http=${HOST_PORT:-33001} off 2>/dev/null || true; \
+    fi
     @echo "stopped."
 
 # Stop everything, then start fresh.

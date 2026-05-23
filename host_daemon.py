@@ -30,6 +30,10 @@ SANDBOX_NAME = os.environ.get("SANDBOX_NAME", "")
 SANDBOX_DIR  = os.environ.get("SANDBOX_DIR", "")
 DASHBOARD_PORT = int(os.environ.get("PORT", "3000"))
 HOST_PORT      = int(os.environ.get("HOST_PORT", "33001"))
+# When set (any non-empty value), every published port is ALSO exposed on the
+# tailnet via `tailscale serve --http=<port>`. Off by default — many users
+# don't have Tailscale and the dashboard is fully usable on loopback alone.
+TAILSCALE_ENABLED = bool(os.environ.get("TAILSCALE", "").strip())
 
 STATE_PATH = Path(SANDBOX_DIR) / ".host-daemon-state.json" if SANDBOX_DIR else None
 
@@ -73,12 +77,12 @@ def _save_state(entries: list[PortEntry]) -> None:
     tmp.replace(STATE_PATH)
 
 
-# ── sbx wrapper ───────────────────────────────────────────────────────────────
+# ── subprocess wrappers ───────────────────────────────────────────────────────
 
-async def _sbx(*args: str) -> tuple[int, str, str]:
-    """Run an sbx command; return (returncode, stdout, stderr)."""
+async def _run(*args: str) -> tuple[int, str, str]:
+    """Run a command; return (returncode, stdout, stderr)."""
     proc = await asyncio.create_subprocess_exec(
-        "sbx", *args,
+        *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -86,22 +90,46 @@ async def _sbx(*args: str) -> tuple[int, str, str]:
     return proc.returncode or 0, out.decode(), err.decode()
 
 
+async def _tailscale_serve(port: int) -> None:
+    """Best-effort: expose localhost:<port> on the tailnet at the same port.
+    Failures are logged but never block the host-local publish — Tailscale
+    might be off, the binary missing, the device not logged in, etc."""
+    if not TAILSCALE_ENABLED:
+        return
+    rc, _, err = await _run("tailscale", "serve", f"--http={port}",
+                            f"http://localhost:{port}")
+    if rc != 0:
+        print(f"[host-daemon] tailscale serve --http={port}: {err.strip() or 'failed'}",
+              file=sys.stderr)
+
+
+async def _tailscale_unserve(port: int) -> None:
+    """Best-effort: remove the tailnet serve for this port."""
+    if not TAILSCALE_ENABLED:
+        return
+    await _run("tailscale", "serve", f"--http={port}", "off")
+
+
 async def _publish(entry: PortEntry) -> None:
     async with _sbx_lock:
-        rc, _, err = await _sbx("ports", SANDBOX_NAME, "--publish", entry.spec())
+        rc, _, err = await _run("sbx", "ports", SANDBOX_NAME, "--publish", entry.spec())
     if rc != 0:
         raise HTTPException(
             status_code=409,
             detail=f"sbx publish failed: {err.strip() or 'unknown error'}",
         )
+    await _tailscale_serve(entry.port)
 
 
 async def _unpublish(entry: PortEntry) -> None:
+    # Tear down tailnet serve first so we never leave the tailnet pointing
+    # at a port that no longer exists on the host.
+    await _tailscale_unserve(entry.port)
     async with _sbx_lock:
         # --unpublish failures are best-effort: a port may already be gone
         # (sandbox restart, manual unpublish) and we still want to drop it
         # from our state.
-        await _sbx("ports", SANDBOX_NAME, "--unpublish", entry.spec())
+        await _run("sbx", "ports", SANDBOX_NAME, "--unpublish", entry.spec())
 
 
 # ── Lifespan: reconcile on startup, clear on shutdown ────────────────────────
@@ -127,6 +155,7 @@ async def lifespan(app: FastAPI):
 
     print(f"[host-daemon] ready on 127.0.0.1:{HOST_PORT} "
           f"(sandbox={SANDBOX_NAME}, dashboard_port={DASHBOARD_PORT}, "
+          f"tailscale={'on' if TAILSCALE_ENABLED else 'off'}, "
           f"{len(app.state.entries)} port(s) reconciled)", file=sys.stderr)
 
     yield
@@ -147,8 +176,7 @@ app = FastAPI(lifespan=lifespan)
 # Restrict CORS to the dashboard origin so a malicious site the user visits
 # can't drive this daemon via the browser. POST/DELETE bodies use JSON, which
 # forces a preflight that disallowed origins can't pass.
-app.add_middleware(
-    CORSMiddleware,
+_cors_kwargs: dict = dict(
     allow_origins=[
         f"http://127.0.0.1:{DASHBOARD_PORT}",
         f"http://localhost:{DASHBOARD_PORT}",
@@ -157,6 +185,13 @@ app.add_middleware(
     allow_headers=["Content-Type"],
     allow_credentials=False,
 )
+if TAILSCALE_ENABLED:
+    # Tailnet hostnames are <machine>.<tailnet>.ts.net; ts.net is exclusively
+    # issued by Tailscale, so allowing any ts.net origin is bounded by the
+    # tailnet itself. The dashboard JS uses ${location.hostname}:${port},
+    # so the daemon needs to accept the tailnet origin when accessed via phone.
+    _cors_kwargs["allow_origin_regex"] = r"^https?://[^/]+\.ts\.net(:\d+)?$"
+app.add_middleware(CORSMiddleware, **_cors_kwargs)
 
 
 def _require_json(request: Request) -> None:
