@@ -4,7 +4,7 @@
 // reach the host daemon. Build the URL from location.hostname so this works
 // for both 127.0.0.1 and (eventually) tailnet access.
 const HOST_DAEMON_PORT = document.querySelector('meta[name=host-daemon-port]')?.content || '33001';
-const HOST_DAEMON = `http://${location.hostname}:${HOST_DAEMON_PORT}`;
+const HOST_DAEMON = `${location.protocol}//${location.hostname}:${HOST_DAEMON_PORT}`;
 
 async function hdFetch(path, opts = {}) {
   return fetch(HOST_DAEMON + path, { cache: 'no-store', ...opts });
@@ -36,7 +36,23 @@ document.addEventListener('keydown', e => {
   if (e.key !== 'Escape') return;
   closeModal();
   closePortModal();
+  closeApp();
 });
+
+// ── Full-screen app overlay ───────────────────────────────────────────────────
+function openApp(url) {
+  document.getElementById('app-frame').src = url;
+  document.getElementById('app-overlay').classList.add('visible');
+  history.pushState({ appOverlay: true }, '');
+}
+function closeApp() {
+  const overlay = document.getElementById('app-overlay');
+  if (!overlay.classList.contains('visible')) return;
+  overlay.classList.remove('visible');
+  document.getElementById('app-frame').src = '';
+}
+// Android back gesture / browser back button closes the overlay
+window.addEventListener('popstate', () => closeApp());
 
 // Intercept project-destroy submit: tell the host daemon to drop all of the
 // project's exposed ports BEFORE the sandbox tears down the project itself.
@@ -49,7 +65,11 @@ document.getElementById('m-form').addEventListener('submit', async (e) => {
   try {
     await hdFetch(`/projects/${encodeURIComponent(project)}/ports`, { method: 'DELETE' });
   } catch (_) { /* best-effort */ }
-  e.target.submit();
+  try {
+    await fetch(e.target.action, { method: 'POST', body: new FormData(e.target) });
+  } catch (_) {}
+  closeModal();
+  await refreshGroups();
 });
 
 // ── Add-port modal ───────────────────────────────────────────────────────────
@@ -182,17 +202,17 @@ async function hydratePorts() {
       <div class="ports-header"><span class="ports-label">exposed ports</span></div>
       <div class="ports-list">
         ${list.map(p => {
-          const url = `http://${location.hostname}:${p.port}`;
+          const url = `${location.protocol}//${location.hostname}:${p.port}`;
           return `
           <div class="port-preview">
-            <a class="port-preview-frame" href="${url}" target="_blank" rel="noopener"
-               title="Open :${p.port} in a new tab">
+            <a class="port-preview-frame" href="${url}" onclick="openApp('${url}'); return false;"
+               title="Open :${p.port}">
               <iframe class="port-preview-iframe" src="${url}" loading="lazy"
                       referrerpolicy="no-referrer" tabindex="-1"
                       aria-hidden="true"></iframe>
             </a>
             <div class="port-preview-footer">
-              <a class="port-link" href="${url}" target="_blank" rel="noopener">:${p.port}</a>
+              <a class="port-link" href="${url}" onclick="openApp('${url}'); return false;">:${p.port}</a>
               <span class="port-proto">${p.protocol}</span>
               <span class="port-spacer"></span>
               <button type="button" class="port-remove" data-port="${p.port}" data-protocol="${p.protocol}"
@@ -283,15 +303,34 @@ setInterval(refreshGroups, REFRESH_MS);
 // Also refresh immediately when the tab regains focus
 document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshGroups(); });
 
-// Event-driven refresh when the user creates a new project/session.
-// Both "+ New Project" and "+ Session" forms POST to /sessions and open in a
-// new tab — the dashboard tab's JS keeps running, so we can react to the submit
-// directly. Backend writes the DB row early but full setup takes a beat, so we
-// poll at several delays to catch it as soon as it appears.
-document.addEventListener('submit', (e) => {
-  const action = e.target.getAttribute('action');
+// Handle all /sessions form submissions in JS.
+// Native target="_blank" POST forms break in Android PWA standalone mode —
+// Chrome opens a Custom Tab that makes a GET instead of following the POST
+// redirect, resulting in 405. Doing the POST via fetch and opening the result
+// with window.open (called synchronously before the await to stay within the
+// user-gesture context) works correctly on both desktop and mobile PWA.
+document.addEventListener('submit', async (e) => {
+  const form = e.target;
+  const action = form.getAttribute('action') || '';
+
   if (action === '/sessions') {
+    // Create / +Session: open terminal in new tab
+    e.preventDefault();
+    const win = window.open('', '_blank');  // synchronous — must stay within user-gesture context
+    const body = new FormData(form);
+    form.reset();
+    try {
+      const r = await fetch('/sessions', { method: 'POST', body });
+      if (r.ok && win) win.location.href = r.url;
+      else if (win) win.close();
+    } catch (_) { if (win) win.close(); }
     [400, 1200, 2500].forEach(ms => setTimeout(refreshGroups, ms));
+
+  } else if (action.endsWith('/kill')) {
+    // Kill session: fetch in place, refresh dashboard without page reload
+    e.preventDefault();
+    try { await fetch(action, { method: 'POST' }); } catch (_) {}
+    await refreshGroups();
   }
 });
 

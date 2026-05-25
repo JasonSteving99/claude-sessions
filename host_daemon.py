@@ -12,6 +12,7 @@ State is persisted to $SANDBOX_DIR/.host-daemon-state.json so a hard crash
 doesn't leave orphan host port publishes; on graceful shutdown all ports are
 unpublished and state is cleared.
 """
+
 import asyncio
 import json
 import os
@@ -27,9 +28,9 @@ from pydantic import BaseModel, Field
 
 
 SANDBOX_NAME = os.environ.get("SANDBOX_NAME", "")
-SANDBOX_DIR  = os.environ.get("SANDBOX_DIR", "")
+SANDBOX_DIR = os.environ.get("SANDBOX_DIR", "")
 DASHBOARD_PORT = int(os.environ.get("PORT", "3000"))
-HOST_PORT      = int(os.environ.get("HOST_PORT", "33001"))
+HOST_PORT = int(os.environ.get("HOST_PORT", "33001"))
 # When set (any non-empty value), every published port is ALSO exposed on the
 # tailnet via `tailscale serve --http=<port>`. Off by default — many users
 # don't have Tailscale and the dashboard is fully usable on loopback alone.
@@ -44,9 +45,10 @@ _sbx_lock = asyncio.Lock()
 
 # ── State ─────────────────────────────────────────────────────────────────────
 
+
 class PortEntry(BaseModel):
-    project:  str
-    port:     int = Field(ge=1, le=65535)
+    project: str
+    port: int = Field(ge=1, le=65535)
     protocol: str = "tcp"
 
     def spec(self) -> str:
@@ -79,6 +81,7 @@ def _save_state(entries: list[PortEntry]) -> None:
 
 # ── subprocess wrappers ───────────────────────────────────────────────────────
 
+
 async def _run(*args: str) -> tuple[int, str, str]:
     """Run a command; return (returncode, stdout, stderr)."""
     proc = await asyncio.create_subprocess_exec(
@@ -96,18 +99,21 @@ async def _tailscale_serve(port: int) -> None:
     might be off, the binary missing, the device not logged in, etc."""
     if not TAILSCALE_ENABLED:
         return
-    rc, _, err = await _run("tailscale", "serve", "--bg", f"--http={port}",
-                            f"http://127.0.0.1:{port}")
+    rc, _, err = await _run(
+        "tailscale", "serve", "--bg", f"--https={port}", f"http://127.0.0.1:{port}"
+    )
     if rc != 0:
-        print(f"[host-daemon] tailscale serve --http={port}: {err.strip() or 'failed'}",
-              file=sys.stderr)
+        print(
+            f"[host-daemon] tailscale serve --https={port}: {err.strip() or 'failed'}",
+            file=sys.stderr,
+        )
 
 
 async def _tailscale_unserve(port: int) -> None:
     """Best-effort: remove the tailnet serve for this port."""
     if not TAILSCALE_ENABLED:
         return
-    await _run("tailscale", "serve", f"--http={port}", "off")
+    await _run("tailscale", "serve", f"--https={port}", "off")
 
 
 async def _publish(entry: PortEntry) -> None:
@@ -134,6 +140,7 @@ async def _unpublish(entry: PortEntry) -> None:
 
 # ── Lifespan: reconcile on startup, clear on shutdown ────────────────────────
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if not SANDBOX_NAME:
@@ -153,10 +160,13 @@ async def lifespan(app: FastAPI):
         except HTTPException as exc:
             print(f"[host-daemon] reconcile: {e.spec()}: {exc.detail}", file=sys.stderr)
 
-    print(f"[host-daemon] ready on 127.0.0.1:{HOST_PORT} "
-          f"(sandbox={SANDBOX_NAME}, dashboard_port={DASHBOARD_PORT}, "
-          f"tailscale={'on' if TAILSCALE_ENABLED else 'off'}, "
-          f"{len(app.state.entries)} port(s) reconciled)", file=sys.stderr)
+    print(
+        f"[host-daemon] ready on 127.0.0.1:{HOST_PORT} "
+        f"(sandbox={SANDBOX_NAME}, dashboard_port={DASHBOARD_PORT}, "
+        f"tailscale={'on' if TAILSCALE_ENABLED else 'off'}, "
+        f"{len(app.state.entries)} port(s) reconciled)",
+        file=sys.stderr,
+    )
 
     yield
 
@@ -167,8 +177,7 @@ async def lifespan(app: FastAPI):
         await _unpublish(e)
     app.state.entries = []
     _save_state([])
-    print("[host-daemon] shutdown: all ports unpublished, state cleared",
-          file=sys.stderr)
+    print("[host-daemon] shutdown: all ports unpublished, state cleared", file=sys.stderr)
 
 
 app = FastAPI(lifespan=lifespan)
@@ -190,7 +199,7 @@ if TAILSCALE_ENABLED:
     # issued by Tailscale, so allowing any ts.net origin is bounded by the
     # tailnet itself. The dashboard JS uses ${location.hostname}:${port},
     # so the daemon needs to accept the tailnet origin when accessed via phone.
-    _cors_kwargs["allow_origin_regex"] = r"^https?://[^/]+\.ts\.net(:\d+)?$"
+    _cors_kwargs["allow_origin_regex"] = r"^https://[^/]+\.ts\.net(:\d+)?$"
 app.add_middleware(CORSMiddleware, **_cors_kwargs)
 
 
@@ -204,6 +213,7 @@ def _require_json(request: Request) -> None:
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
+
 
 @app.get("/healthz")
 async def healthz():
@@ -223,7 +233,9 @@ async def add_port(entry: PortEntry, request: Request):
     _require_json(request)
     existing = {e.key() for e in app.state.entries}
     if entry.key() in existing:
-        raise HTTPException(status_code=409, detail=f"port {entry.port}/{entry.protocol} already exposed")
+        raise HTTPException(
+            status_code=409, detail=f"port {entry.port}/{entry.protocol} already exposed"
+        )
     await _publish(entry)
     app.state.entries.append(entry)
     _save_state(app.state.entries)

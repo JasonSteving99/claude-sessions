@@ -2,7 +2,20 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0d1117">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Claude Sessions">
+  <meta name="application-name" content="Claude Sessions">
+  <meta name="msapplication-TileColor" content="#0d1117">
+  <meta name="msapplication-TileImage" content="/static/icons/icon-144.png">
   <title>Claude Sessions</title>
+  <link rel="manifest" href="/static/manifest.json">
+  <link rel="icon" type="image/x-icon" href="/static/icons/favicon.ico">
+  <link rel="apple-touch-icon" sizes="152x152" href="/static/icons/icon-152.png">
+  <link rel="apple-touch-icon" sizes="192x192" href="/static/icons/icon-192.png">
   <meta name="host-daemon-port" content="{{ host_port }}">
   <link rel="stylesheet" href="/static/styles.css">
 </head>
@@ -25,8 +38,7 @@
       </div>
       <div class="project-dir">Creates {{ project_base }}/&lt;name&gt;. Reusing a name on an existing project adds a session to it instead.</div>
     </header>
-    <form class="new-project-form" method="POST" action="/sessions" target="_blank"
-          onsubmit="setTimeout(() => this.reset(), 0)">
+    <form class="new-project-form" method="POST" action="/sessions">
       <input type="text" name="name" placeholder="my-project" required />
       <button type="submit" class="btn create">Create &amp; Open</button>
     </form>
@@ -70,6 +82,15 @@
   </div>
 </div>
 
+<div id="app-overlay">
+  <iframe id="app-frame"></iframe>
+</div>
+
 <script src="/static/dashboard.js"></script>
+<script>
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js', { scope: '/' });
+  }
+</script>
 </body>
 </html>

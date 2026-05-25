@@ -72,12 +72,12 @@ up:
         if ! command -v tailscale >/dev/null 2>&1; then \
             echo "warning: TAILSCALE is set but 'tailscale' is not on PATH — skipping tailnet serve" >&2; \
         else \
-            echo "tailscale: serving dashboard at http://<tailnet>:${PORT}..."; \
-            tailscale serve --bg --http=${PORT} "http://127.0.0.1:${PORT}" 2>&1 || true; \
-            echo "tailscale: serving host daemon at http://<tailnet>:${HOST_PORT:-33001}..."; \
-            tailscale serve --bg --http=${HOST_PORT:-33001} "http://127.0.0.1:${HOST_PORT:-33001}" 2>&1 || true; \
+            echo "tailscale: serving dashboard at https://<tailnet>:${PORT}..."; \
+            tailscale serve --bg --https=${PORT} "http://127.0.0.1:${PORT}" 2>&1 || true; \
+            echo "tailscale: serving host daemon at https://<tailnet>:${HOST_PORT:-33001}..."; \
+            tailscale serve --bg --https=${HOST_PORT:-33001} "http://127.0.0.1:${HOST_PORT:-33001}" 2>&1 || true; \
             tsname=$(tailscale status --self --json 2>/dev/null | sed -n 's/.*"DNSName":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1 | sed 's/\.$//'); \
-            [ -n "$tsname" ] && echo "→ tailnet: http://${tsname}:${PORT}"; \
+            [ -n "$tsname" ] && echo "→ tailnet: https://${tsname}:${PORT}"; \
         fi; \
     fi
     @echo "→ http://127.0.0.1:${PORT}"
@@ -116,8 +116,8 @@ down:
     # daemon already unserved every user-exposed port during its SIGTERM
     # handler above, so we only need to clean up the bootstrap ports here.
     @if [ -n "${TAILSCALE:-}" ] && command -v tailscale >/dev/null 2>&1; then \
-        tailscale serve --http=${PORT} off 2>/dev/null || true; \
-        tailscale serve --http=${HOST_PORT:-33001} off 2>/dev/null || true; \
+        tailscale serve --https=${PORT} off 2>/dev/null || true; \
+        tailscale serve --https=${HOST_PORT:-33001} off 2>/dev/null || true; \
     fi
     @echo "stopped."
 

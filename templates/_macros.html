@@ -54,10 +54,10 @@
           <div class="project-actions">
             <button type="button" class="btn add-port"
                     data-project="{{ p.project }}"
-                    onclick="openAddPort(this)">+ Port</button>
-            <form method="POST" action="/sessions" target="_blank" style="margin:0">
+                    onclick="openAddPort(this)">+Port</button>
+            <form method="POST" action="/sessions" style="margin:0">
               <input type="hidden" name="name" value="{{ p.project }}" />
-              <button type="submit" class="btn add-session">+ Session</button>
+              <button type="submit" class="btn add-session">+Session</button>
             </form>
             <button type="button" class="btn project-delete"
                     data-project="{{ p.project }}"

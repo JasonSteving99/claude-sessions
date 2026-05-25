@@ -1,4 +1,6 @@
 *, *::before, *::after { box-sizing: border-box; }
+/* Prevent any overflowing child from creating horizontal scroll */
+html { overflow-x: clip; }
 body { font-family: 'SF Mono','Fira Code',ui-monospace,monospace;
        background: #0d1117; color: #c9d1d9; margin: 0; padding: 2rem; }
 header { display: flex; align-items: baseline; gap: 1rem; margin-bottom: 2rem; }
@@ -21,6 +23,17 @@ h1 { color: #58a6ff; font-size: 1.35rem; margin: 0; }
 .add-port:hover { background: #1f242c; color: #d2a8ff; border-color: #d2a8ff; }
 .project-delete { background: #1d1117; border-color: #5a1f1c; color: #da3633; }
 .project-delete:hover { background: #3d1a17; border-color: #f85149; color: #f85149; }
+
+/* full-screen app overlay — opened when a port card is tapped */
+#app-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: #000;
+}
+#app-overlay.visible { display: block; }
+#app-frame { display: block; width: 100%; height: 100%; border: none; }
 
 /* destroy-project modal */
 .modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,0.72);
@@ -96,7 +109,8 @@ h1 { color: #58a6ff; font-size: 1.35rem; margin: 0; }
 .no-usage { color: #2d333b; font-size: 0.78rem; font-style: italic; }
 .btn { padding: 0.28rem 0.75rem; border: 1px solid; border-radius: 5px; cursor: pointer;
        font-family: inherit; font-size: 0.8rem; text-decoration: none;
-       display: inline-block; white-space: nowrap; }
+       display: inline-flex; align-items: center; white-space: nowrap;
+       touch-action: manipulation; }
 .open   { background: #0d4429; border-color: #3fb950; color: #3fb950; }
 .open:hover { background: #144620; }
 .kill   { background: #2d1117; border-color: #da3633; color: #da3633; }
@@ -163,3 +177,130 @@ h1 { color: #58a6ff; font-size: 1.35rem; margin: 0; }
                                   font-family: inherit; font-size: 0.95rem; width: 100%; }
 .port-field input[type=number]:focus { outline: none; border-color: #58a6ff; }
 .port-error { color: #f85149; font-size: 0.82rem; margin-top: 0.5rem; }
+
+/* ── Responsive / Mobile ──────────────────────────────────────────────────── */
+/* Eliminate tap-delay on all interactive elements */
+button, a, input, select, textarea { touch-action: manipulation; }
+
+@media (max-width: 640px) {
+  body { padding: 0.875rem; }
+
+  header { margin-bottom: 1.25rem; }
+
+  /* ── Overflow containment ─────────────────────────────────────────────────
+     The root cause of content wider than the viewport:
+     1. CSS grid `1fr` columns respect min-width:auto of their children, so a
+        grid column can grow wider than its container. Fix: minmax(0, 1fr).
+     2. Flex items also default to min-width:auto. Fix: min-width:0.
+     3. Long unbreakable text (e.g. paths) inside overflow:visible containers.
+  */
+  .groups,
+  .project-group,
+  .project-sessions,
+  .ports-list,
+  .card,
+  .port-preview { min-width: 0; }
+
+  /* Card title side must yield space to the action buttons */
+  .card-title { min-width: 0; flex: 1; overflow: hidden; }
+  .sname { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* 2-col meta grid: use minmax(0,1fr) so columns can shrink below content */
+  .meta { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .mv   { min-width: 0; }          /* allow ellipsis truncation to kick in */
+
+  /* Session grid: truly one column, no 340px minimum */
+  .project-sessions { grid-template-columns: minmax(0, 1fr); }
+
+  /* Port list: same */
+  .ports-list { grid-template-columns: minmax(0, 1fr); }
+
+  /* ── Touch targets ────────────────────────────────────────────────────── */
+  .btn {
+    min-height: 44px;
+    padding: 0.5rem 0.875rem;
+    font-size: 0.875rem;
+  }
+
+  .modal-actions button {
+    min-height: 44px;
+    padding: 0.5rem 1.25rem;
+  }
+
+  .port-remove {
+    min-height: 44px;
+    min-width: 44px;
+    font-size: 1.1rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* ── Project header layout ────────────────────────────────────────────── */
+  /* Keep project-id as a row flex (its default). flex-wrap:wrap is already
+     on it in base CSS. Setting flex-basis:100% on each child forces them onto
+     separate rows, giving project-actions an unambiguous 100%-of-parent width
+     that the grid inside can divide. flex-direction:column was previously used
+     here but left width:100% on the grid container ambiguous. */
+  .project-id { gap: 0.5rem; }
+  .project-id-left { flex: 1 0 100%; }
+
+  /* flex: 0 0 100% gives the container an unambiguous 100%-of-parent width.
+     display:flex + flex:1 on buttons is simpler than grid and avoids the
+     grid-inside-flex-item sizing ambiguity. display:contents on the form
+     makes it transparent so +Session is a direct flex sibling of the others. */
+  .project-actions {
+    flex: 0 0 100%;
+    display: flex;
+    gap: 0.4rem;
+  }
+  .project-actions form { display: contents; }
+  .project-actions .btn {
+    flex: 1;
+    min-height: 44px;
+    justify-content: center;
+    padding: 0.5rem 0.4rem;
+    font-size: 0.8rem;
+  }
+
+  /* ── Port previews ────────────────────────────────────────────────────── */
+  /* Keep the iframe thumbnail visible on mobile — the ResizeObserver in
+     dashboard.js scales it to fill whatever card width the grid provides.
+     Just give the footer a bit more padding for easier tapping. */
+  .port-preview-footer {
+    padding: 0.875rem 1rem;
+    min-height: 56px;
+  }
+  .port-link { font-size: 1rem; }
+
+  /* ── New-project section ─────────────────────────────────────────────── */
+  /* The description uses overflow:visible + white-space:normal. A long path
+     with no spaces won't wrap without this. */
+  .new-project .project-dir {
+    overflow-wrap: break-word;
+    word-break: break-word;
+  }
+
+  /* Stack the text input above the Create button */
+  .new-project-form { flex-direction: column; }
+  .new-project-form .btn { width: 100%; justify-content: center; }
+
+  /* ── Typography & readability ─────────────────────────────────────────── */
+  .project-dir, .hint, .project-count { font-size: 0.82rem; }
+  .mi, .usage-row { font-size: 0.875rem; }
+  .no-usage { font-size: 0.82rem; }
+
+  /* ── Inputs ───────────────────────────────────────────────────────────── */
+  .new-project-form input[type=text],
+  .modal-card input[type=text],
+  .port-field input[type=number] {
+    padding: 0.75rem;
+    font-size: 1rem;
+  }
+
+  /* ── Modals ───────────────────────────────────────────────────────────── */
+  .modal-card { width: 95%; padding: 1.25rem 1rem; }
+
+  /* Card action buttons (Open/Kill) wrap on very narrow screens */
+  .actions { flex-wrap: wrap; gap: 0.5rem; flex-shrink: 0; }
+}

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Claude session manager — FastAPI + ttyd + tmux + SQLite."""
+
 import asyncio
 import json
 import os
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -15,10 +17,11 @@ from pathlib import Path
 import httpx
 import websockets
 from fastapi import FastAPI, Form, Request, WebSocket
-from fastapi.responses import RedirectResponse, Response
+from fastapi.responses import FileResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 import uvicorn
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -33,19 +36,19 @@ app = FastAPI(lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
-TMUX          = "/usr/bin/tmux"
-TTYD          = "/usr/bin/ttyd"
-CLAUDE        = "/home/agent/.local/bin/claude"
+TMUX = "/usr/bin/tmux"
+TTYD = "/usr/bin/ttyd"
+CLAUDE = "/home/agent/.local/bin/claude"
 # Project dirs live inside the sandbox's workspace mount so generated files are
 # host-visible. SANDBOX_DIR is validated by _require_sandbox() before use.
-PROJECT_BASE  = Path(os.environ.get("SANDBOX_DIR", "/var/empty")) / "projects"
+PROJECT_BASE = Path(os.environ.get("SANDBOX_DIR", "/var/empty")) / "projects"
 CLAUDE_PROJECTS = Path("/home/agent/.claude/projects")
-DB_PATH       = Path("/home/agent/.session-manager.db")
+DB_PATH = Path("/home/agent/.session-manager.db")
 
 CONTEXT_MAX = {
-    "claude-opus-4-7":   1_000_000,
-    "claude-sonnet-4-6":   200_000,
-    "claude-haiku-4-5":    200_000,
+    "claude-opus-4-7": 1_000_000,
+    "claude-sonnet-4-6": 200_000,
+    "claude-haiku-4-5": 200_000,
 }
 
 # In-memory only: ttyd process/port/open connection count
@@ -53,6 +56,7 @@ _registry: dict[str, dict] = {}
 
 
 # ── Database ──────────────────────────────────────────────────────────────────
+
 
 def _db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -87,9 +91,12 @@ def _db_get(name: str) -> sqlite3.Row | None:
 def _next_session_name(project: str) -> str:
     """Return a unique session name for the given project: 'foo', 'foo-2', 'foo-3', ..."""
     with _db() as conn:
-        existing = {r["name"] for r in conn.execute(
-            "SELECT name FROM sessions WHERE project=?", (project,)
-        ).fetchall()}
+        existing = {
+            r["name"]
+            for r in conn.execute(
+                "SELECT name FROM sessions WHERE project=?", (project,)
+            ).fetchall()
+        }
     if project not in existing:
         return project
     n = 2
@@ -121,6 +128,7 @@ def _db_remove(name: str) -> None:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+
 def _project_dir(project: str) -> Path:
     d = PROJECT_BASE / project
     d.mkdir(parents=True, exist_ok=True)
@@ -135,15 +143,20 @@ def _free_port() -> int:
 
 def _rel(epoch: int) -> str:
     delta = int(time.time()) - epoch
-    if delta < 60:    return f"{delta}s ago"
-    if delta < 3600:  return f"{delta // 60}m ago"
-    if delta < 86400: return f"{delta // 3600}h ago"
+    if delta < 60:
+        return f"{delta}s ago"
+    if delta < 3600:
+        return f"{delta // 60}m ago"
+    if delta < 86400:
+        return f"{delta // 3600}h ago"
     return f"{delta // 86400}d ago"
 
 
 def _fmt(n: int) -> str:
-    if n < 1_000:     return str(n)
-    if n < 1_000_000: return f"{n / 1_000:.1f}k"
+    if n < 1_000:
+        return str(n)
+    if n < 1_000_000:
+        return f"{n / 1_000:.1f}k"
     return f"{n / 1_000_000:.1f}M"
 
 
@@ -156,12 +169,18 @@ def _iso_epoch(ts: str) -> int:
 
 # ── tmux ──────────────────────────────────────────────────────────────────────
 
+
 def _tmux_status() -> dict[str, dict]:
     """Return {name: {created, activity_rel, command}} for all live tmux sessions."""
     r = subprocess.run(
-        [TMUX, "list-sessions", "-F",
-         "#{session_name}\t#{session_created}\t#{session_activity}\t#{pane_current_command}"],
-        capture_output=True, text=True,
+        [
+            TMUX,
+            "list-sessions",
+            "-F",
+            "#{session_name}\t#{session_created}\t#{session_activity}\t#{pane_current_command}",
+        ],
+        capture_output=True,
+        text=True,
     )
     out = {}
     for line in r.stdout.strip().splitlines():
@@ -169,7 +188,7 @@ def _tmux_status() -> dict[str, dict]:
         if len(parts) == 4:
             name, created_s, activity_s, command = parts
             try:
-                created  = int(created_s)
+                created = int(created_s)
                 activity = int(activity_s)
             except ValueError:
                 created = activity = 0
@@ -181,11 +200,20 @@ async def _new_tmux_session(name: str, project: str) -> None:
     project_dir = str(_project_dir(project))
     subprocess.run([TMUX, "new-session", "-d", "-s", name, "-c", project_dir], check=True)
     # cd explicitly: tmux -c silently falls back to $HOME if the dir doesn't exist
-    subprocess.run([TMUX, "send-keys", "-t", name,
-                    f"cd {project_dir} && {CLAUDE} --dangerously-skip-permissions", "Enter"])
+    subprocess.run(
+        [
+            TMUX,
+            "send-keys",
+            "-t",
+            name,
+            f"cd {project_dir} && {CLAUDE} --dangerously-skip-permissions",
+            "Enter",
+        ]
+    )
 
 
 # ── Claude session ID detection ───────────────────────────────────────────────
+
 
 def _first_epoch_in_jsonl(path: Path) -> int:
     try:
@@ -225,6 +253,7 @@ async def _detect_claude_session(name: str, created_at: int, snapshot: set[Path]
 
 
 # ── Usage scraping ────────────────────────────────────────────────────────────
+
 
 def _scrape_session_data(project_key: str | None, session_id: str | None) -> dict:
     """Return title + usage stats scraped from the session's claude jsonl file."""
@@ -272,15 +301,15 @@ def _scrape_session_data(project_key: str | None, session_id: str | None) -> dic
                     continue
                 inp = usage.get("input_tokens", 0)
                 out = usage.get("output_tokens", 0)
-                cr  = usage.get("cache_read_input_tokens", 0)
-                cw  = usage.get("cache_creation_input_tokens", 0)
-                total_in  += inp
+                cr = usage.get("cache_read_input_tokens", 0)
+                cw = usage.get("cache_creation_input_tokens", 0)
+                total_in += inp
                 total_out += out
-                cache_read  += cr
+                cache_read += cr
                 cache_write += cw
                 ctx = inp + cr + cw
                 if ctx:
-                    latest_ctx   = ctx
+                    latest_ctx = ctx
                     latest_model = obj.get("message", {}).get("model")
     except Exception:
         pass
@@ -295,17 +324,18 @@ def _scrape_session_data(project_key: str | None, session_id: str | None) -> dic
         max_ctx = CONTEXT_MAX.get(latest_model, 200_000)
         ctx_pct = round(latest_ctx / max_ctx * 100, 1) if latest_ctx else 0
         result["usage"] = {
-            "in":         _fmt(total_in),
-            "out":        _fmt(total_out),
+            "in": _fmt(total_in),
+            "out": _fmt(total_out),
             "cache_read": _fmt(cache_read),
-            "ctx":        _fmt(latest_ctx),
-            "max_ctx":    _fmt(max_ctx),
-            "ctx_pct":    ctx_pct,
+            "ctx": _fmt(latest_ctx),
+            "max_ctx": _fmt(max_ctx),
+            "ctx_pct": ctx_pct,
         }
     return result
 
 
 # ── ttyd proxy ────────────────────────────────────────────────────────────────
+
 
 async def _ensure_ttyd(name: str) -> int:
     entry = _registry.get(name)
@@ -313,9 +343,20 @@ async def _ensure_ttyd(name: str) -> int:
         return entry["port"]
     port = _free_port()
     proc = subprocess.Popen(
-        [TTYD, "-p", str(port), "-i", "127.0.0.1", "--writable",
-         TMUX, "attach-session", "-t", name],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        [
+            TTYD,
+            "-p",
+            str(port),
+            "-i",
+            "127.0.0.1",
+            "--writable",
+            TMUX,
+            "attach-session",
+            "-t",
+            name,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
     prev = _registry.get(name, {})
     _registry[name] = {"port": port, "proc": proc, "connections": prev.get("connections", 0)}
@@ -332,9 +373,12 @@ async def _ensure_ttyd(name: str) -> int:
 
 # ── View context ──────────────────────────────────────────────────────────────
 
+
 def _cmd_class(command: str) -> str:
-    if command == "claude":           return "cmd-claude"
-    if command in ("bash","sh","zsh","fish"): return "cmd-shell"
+    if command == "claude":
+        return "cmd-claude"
+    if command in ("bash", "sh", "zsh", "fish"):
+        return "cmd-shell"
     return "cmd-other"
 
 
@@ -342,7 +386,7 @@ def _build_session_ctx(s, tmux: dict[str, dict]) -> dict:
     """Build the template context dict for a single session card."""
     name = s["name"]
     live = name in tmux
-    tm   = tmux.get(name, {})
+    tm = tmux.get(name, {})
     conn = _registry.get(name, {}).get("connections", 0)
 
     data = _scrape_session_data(s["claude_project_key"], s["claude_session_id"])
@@ -350,28 +394,28 @@ def _build_session_ctx(s, tmux: dict[str, dict]) -> dict:
     u = data.get("usage")
     if u:
         ctx_pct = u["ctx_pct"]
-        fill_cls = ("ctx-fill danger" if ctx_pct >= 80
-                    else "ctx-fill warn" if ctx_pct >= 60
-                    else "ctx-fill")
+        fill_cls = (
+            "ctx-fill danger" if ctx_pct >= 80 else "ctx-fill warn" if ctx_pct >= 60 else "ctx-fill"
+        )
         usage = {
             **u,
-            "fill_cls":  fill_cls,
+            "fill_cls": fill_cls,
             "ctx_width": min(ctx_pct, 100),
         }
 
     return {
-        "name":         name,
-        "live":         live,
-        "card_cls":     "card" if live else "card stopped",
-        "dot_cls":      ("dot" if conn > 0 else "dot idle") if live else "dot stopped",
-        "cmd":          tm.get("command", "—"),
-        "cmd_cls":      _cmd_class(tm.get("command", "—")),
-        "views_cls":    "views-live" if conn > 0 else "",
-        "views_label":  f"{conn} active" if conn > 0 else "none",
-        "created_rel":  _rel(s["created_at"]),
+        "name": name,
+        "live": live,
+        "card_cls": "card" if live else "card stopped",
+        "dot_cls": ("dot" if conn > 0 else "dot idle") if live else "dot stopped",
+        "cmd": tm.get("command", "—"),
+        "cmd_cls": _cmd_class(tm.get("command", "—")),
+        "views_cls": "views-live" if conn > 0 else "",
+        "views_label": f"{conn} active" if conn > 0 else "none",
+        "created_rel": _rel(s["created_at"]),
         "activity_rel": tm.get("activity_rel", "—"),
-        "title":        data.get("title"),
-        "usage":        usage,
+        "title": data.get("title"),
+        "usage": usage,
     }
 
 
@@ -381,37 +425,61 @@ def _build_projects_ctx(db_sessions: list, tmux: dict[str, dict]) -> list[dict]:
     for s in db_sessions:
         by_project.setdefault(s["project"], []).append(s)
 
+    # Include project dirs that exist on disk but have no DB sessions (e.g. after
+    # killing the last session — the directory outlives its session records).
+    if PROJECT_BASE.exists():
+        for d in PROJECT_BASE.iterdir():
+            if d.is_dir() and d.name not in by_project:
+                by_project[d.name] = []
+
     projects: list[dict] = []
     for project, sessions in by_project.items():
+        project_dir = sessions[0]["project_dir"] if sessions else str(PROJECT_BASE / project)
         count = len(sessions)
-        projects.append({
-            "project":     project,
-            "project_dir": sessions[0]["project_dir"],
-            "count":       count,
-            "suffix":      "s" if count != 1 else "",
-            "sessions":    [_build_session_ctx(s, tmux) for s in sessions],
-        })
+        projects.append(
+            {
+                "project": project,
+                "project_dir": project_dir,
+                "count": count,
+                "suffix": "s" if count != 1 else "",
+                "sessions": [_build_session_ctx(s, tmux) for s in sessions],
+            }
+        )
     return projects
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
+
+@app.get("/sw.js")
+async def service_worker():
+    return FileResponse("static/sw.js", headers={"Service-Worker-Allowed": "/"})
+
+
 @app.get("/")
 async def landing(request: Request):
-    return templates.TemplateResponse(request, "dashboard.html", {
-        "projects":     _build_projects_ctx(_db_all(), _tmux_status()),
-        "project_base": str(PROJECT_BASE),
-        "host_port":    int(os.environ.get("HOST_PORT", "33001")),
-    })
+    return templates.TemplateResponse(
+        request,
+        "dashboard.html",
+        {
+            "projects": _build_projects_ctx(_db_all(), _tmux_status()),
+            "project_base": str(PROJECT_BASE),
+            "host_port": int(os.environ.get("HOST_PORT", "33001")),
+        },
+    )
 
 
 @app.get("/partial/groups")
 async def partial_groups(request: Request):
     """Just the project groups HTML, for live in-page refresh from JS."""
-    return templates.TemplateResponse(request, "groups.html", {
-        "projects":     _build_projects_ctx(_db_all(), _tmux_status()),
-        "project_base": str(PROJECT_BASE),
-    })
+    return templates.TemplateResponse(
+        request,
+        "groups.html",
+        {
+            "projects": _build_projects_ctx(_db_all(), _tmux_status()),
+            "project_base": str(PROJECT_BASE),
+        },
+    )
 
 
 @app.post("/sessions")
@@ -455,19 +523,16 @@ async def destroy_project(project: str, confirm: str = Form("")):
     # UI gates the button. Keeps curl/scripts from accidentally nuking a project.
     if confirm != "DELETE":
         return Response("missing or wrong confirmation token", status_code=400)
-    project_dir = None
     sessions = [r for r in _db_all() if r["project"] == project]
+    project_dir = sessions[0]["project_dir"] if sessions else str(PROJECT_BASE / project)
     for s in sessions:
         n = s["name"]
-        project_dir = s["project_dir"]
         entry = _registry.pop(n, None)
         if entry:
             entry["proc"].terminate()
         subprocess.run([TMUX, "kill-session", "-t", n], capture_output=True)
         _db_remove(n)
-    if project_dir:
-        import shutil
-        shutil.rmtree(project_dir, ignore_errors=True)
+    shutil.rmtree(project_dir, ignore_errors=True)
     return RedirectResponse("/", status_code=303)
 
 
@@ -481,14 +546,17 @@ async def ws_proxy(websocket: WebSocket, name: str):
         async with websockets.connect(
             f"ws://127.0.0.1:{port}/ws", subprotocols=["tty"]
         ) as upstream:
+
             async def to_upstream():
                 try:
                     while True:
                         msg = await websocket.receive()
                         if msg["type"] == "websocket.disconnect":
                             break
-                        if msg.get("bytes"):  await upstream.send(msg["bytes"])
-                        elif msg.get("text"): await upstream.send(msg["text"])
+                        if msg.get("bytes"):
+                            await upstream.send(msg["bytes"])
+                        elif msg.get("text"):
+                            await upstream.send(msg["text"])
                 except Exception:
                     pass
                 finally:
@@ -497,8 +565,10 @@ async def ws_proxy(websocket: WebSocket, name: str):
             async def to_client():
                 try:
                     async for msg in upstream:
-                        if isinstance(msg, bytes): await websocket.send_bytes(msg)
-                        else:                      await websocket.send_text(msg)
+                        if isinstance(msg, bytes):
+                            await websocket.send_bytes(msg)
+                        else:
+                            await websocket.send_text(msg)
                 except Exception:
                     pass
 
@@ -520,9 +590,7 @@ async def http_proxy(name: str, path: str, request: Request):
     port = await _ensure_ttyd(name)
     skip = {"transfer-encoding", "connection", "keep-alive", "content-encoding", "content-length"}
     async with httpx.AsyncClient() as client:
-        r = await client.get(
-            f"http://127.0.0.1:{port}/{path}", params=dict(request.query_params)
-        )
+        r = await client.get(f"http://127.0.0.1:{port}/{path}", params=dict(request.query_params))
         headers = {k: v for k, v in r.headers.items() if k.lower() not in skip}
         return Response(content=r.content, status_code=r.status_code, headers=headers)
 
